@@ -1,0 +1,125 @@
+name: Build and test
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated Go test names to run (empty runs the full suite)"
+        required: false
+        default: ""
+
+jobs:
+  build-test:
+    name: Go ${{ matrix.go-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: ["1.24", "1.25"]
+    env:
+      MODULE_PATH: golang.org/x/net
+      MODULE_VERSION: v0.45.0
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: false
+
+      - name: Download and verify dependencies
+        run: |
+          go version
+          go mod download
+          go mod verify
+
+      - name: Build
+        run: go build -v ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        shell: bash
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -o pipefail
+          if [ -n "$TEST_FILTER" ]; then
+            pattern="^($(echo "$TEST_FILTER" | tr ' ' '|'))$"
+            go test -v -run "$pattern" ./... > "$RUNNER_TEMP/test.log" 2>&1 && status=0 || status=$?
+          else
+            go test -v ./... > "$RUNNER_TEMP/test.log" 2>&1 && status=0 || status=$?
+          fi
+          echo "::group::Full verbose test output"
+          cat "$RUNNER_TEMP/test.log"
+          echo "::endgroup::"
+          echo "===== Per-package results ====="
+          grep -E '^(ok|FAIL|\?)[[:space:]]' "$RUNNER_TEMP/test.log" || echo "none"
+          echo "===== Failures ====="
+          grep -E '^[[:space:]]*--- FAIL' "$RUNNER_TEMP/test.log" || echo "none"
+          echo "===== Test summary ====="
+          echo "packages ok:      $(grep -cE '^ok[[:space:]]' "$RUNNER_TEMP/test.log")"
+          echo "packages failed:  $(grep -cE '^FAIL[[:space:]]' "$RUNNER_TEMP/test.log")"
+          echo "tests passed:     $(grep -cE '^[[:space:]]*--- PASS' "$RUNNER_TEMP/test.log") (top-level: $(grep -cE '^--- PASS' "$RUNNER_TEMP/test.log"))"
+          echo "tests failed:     $(grep -cE '^[[:space:]]*--- FAIL' "$RUNNER_TEMP/test.log")"
+          echo "tests skipped:    $(grep -cE '^[[:space:]]*--- SKIP' "$RUNNER_TEMP/test.log")"
+          if [ -n "$TEST_FILTER" ]; then
+            for t in $TEST_FILTER; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" "$RUNNER_TEMP/test.log" || { echo "selected test $t did not run"; exit 1; }
+            done
+          fi
+          exit $status
+
+      - name: Create module zip
+        if: matrix.go-version == '1.24'
+        shell: bash
+        run: |
+          set -eo pipefail
+          # Keep the fork-only workflow out of the module zip; the public zip has no .github.
+          rm -f .github/workflows/build.yml
+          find .github -type d -empty -delete
+          mkdir -p "$RUNNER_TEMP/modzip" "$RUNNER_TEMP/dist"
+          cat > "$RUNNER_TEMP/modzip/main.go" <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              if len(os.Args) != 5 {
+                  log.Fatal("usage: modzip <module-path> <version> <source-dir> <output-zip>")
+              }
+              m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                  log.Fatal(err)
+              }
+              log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          cd "$RUNNER_TEMP/modzip"
+          go mod init example.com/modzip
+          go get golang.org/x/mod@v0.28.0
+          go run . "$MODULE_PATH" "$MODULE_VERSION" "$GITHUB_WORKSPACE" "$RUNNER_TEMP/dist/$MODULE_VERSION.zip"
+          unzip -l "$RUNNER_TEMP/dist/$MODULE_VERSION.zip" | tail -n 3
+
+      - name: Upload module zip
+        if: matrix.go-version == '1.24'
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/dist/*.zip
+          if-no-files-found: error
